@@ -1,11 +1,6 @@
 # ADAPTIVE-GOLD-SILVER-BITCOIN-HEDGING-STRATEGY
 ADAPTIVE GOLD/SILVER-BITCOIN HEDGING STRATEGY
 
-Author:         QuantLife
-Platform:       QuantConnect Lean Algorithm Framework
-Version:        2.0
-Last Updated:   January 2026
-
 --------------------------------------------------------------------------------
 STRATEGY OVERVIEW
 --------------------------------------------------------------------------------
