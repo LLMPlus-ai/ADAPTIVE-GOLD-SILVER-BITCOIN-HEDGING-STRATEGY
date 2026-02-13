@@ -1,0 +1,1310 @@
+"""
+================================================================================
+ADAPTIVE GOLD/SILVER-BITCOIN HEDGING STRATEGY
+================================================================================
+
+Author:         QuantLife
+Platform:       QuantConnect Lean Algorithm Framework
+Version:        2.0
+Last Updated:   January 2026
+
+--------------------------------------------------------------------------------
+STRATEGY OVERVIEW
+--------------------------------------------------------------------------------
+
+This algorithm implements an adaptive trend-following strategy for Bitcoin (BTC)
+that uses precious metals (Gold and Silver) as macro risk indicators. The core
+thesis is that Gold-BTC correlation is time-varying and regime-dependent:
+
+    - Normal periods:       Correlation ~0.10 (weak positive)
+    - Macro risk events:    Correlation ~0.40-0.50 (metals lead by 1-2 days)
+    - Explosive bull runs:  Correlation ~0.00 (crypto-specific factors dominate)
+
+By dynamically detecting market phases and adjusting signal weights accordingly,
+the strategy aims to:
+    1. Capture upside during bullish trends
+    2. Reduce exposure before significant drawdowns
+    3. Maintain risk-adjusted returns (Sharpe > 1.0)
+    4. Limit maximum drawdown to under 20%
+
+--------------------------------------------------------------------------------
+METHODOLOGY SUMMARY
+--------------------------------------------------------------------------------
+
+1. PHASE DETECTION
+   - Classifies BTC into 6 market phases using technical indicators
+   - Uses 90-day returns, 30-day volatility, MA relationships, and drawdown
+   - 3-day confirmation filter prevents whipsawing
+
+2. SIGNAL GENERATION
+   - Precious Metals Signal: Normalized 5d and 20d returns of GLD/SLV
+   - Momentum Signal: BTC price momentum relative to moving averages
+   - Composite Signal: Weighted combination based on detected phase
+
+3. POSITION SIZING
+   - Base position from signal strength (0% to phase maximum)
+   - Volatility adjustment using risk parity principles
+   - Breakout bonuses and VIX-based adjustments
+
+4. RISK MANAGEMENT
+   - Fixed stop loss at -15% from entry
+   - Trailing stop: -10% from high after +20% gain
+   - Phase-specific position caps
+   - Precious metals warning system
+
+--------------------------------------------------------------------------------
+COMPETITION REQUIREMENTS
+--------------------------------------------------------------------------------
+
+    Starting Capital:   $100,000
+    Minimum Sharpe:     1.0
+    Maximum Drawdown:   20%
+    Backtest Period:    7+ years
+    Benchmark:          BTCUSD (crypto strategy)
+    Maximum Leverage:   10x (strategy uses max 1x)
+
+--------------------------------------------------------------------------------
+REFERENCES
+--------------------------------------------------------------------------------
+
+    [1] Historical Gold-BTC correlation analysis (2014-2024)
+    [2] Bitcoin market cycle research
+    [3] Risk parity portfolio construction principles
+
+================================================================================
+"""
+
+# ==============================================================================
+# IMPORTS
+# ==============================================================================
+
+from AlgorithmImports import *
+import numpy as np
+from collections import deque
+from enum import Enum
+
+# ==============================================================================
+# MARKET PHASE ENUMERATION
+# ==============================================================================
+
+class BTCPhase(Enum):
+    """
+    Enumeration of Bitcoin market phases.
+    
+    Each phase represents a distinct market regime with characteristic
+    price behavior, volatility patterns, and optimal trading approaches.
+    The strategy adapts its parameters based on the detected phase.
+    
+    Phases:
+    -------
+    ACCUMULATION : Low volatility consolidation period
+        - Typically follows bear market bottoms
+        - Characterized by narrow trading ranges
+        - Smart money accumulation occurs here
+        
+    EARLY_BULL : Initial phase of bull market
+        - Moderate price appreciation (20-100% over 90 days)
+        - Breaking above key moving averages
+        - Increasing but controlled volatility
+        
+    EXPLOSIVE_BULL : Parabolic price advance
+        - Extreme gains (>100% in 90 days)
+        - Very high volatility (>80% annualized)
+        - Retail FOMO drives prices
+        - Precious metals correlation breaks down
+        
+    DISTRIBUTION : Top formation and profit-taking
+        - Price consolidates at highs
+        - Lower highs forming
+        - Increased selling pressure
+        
+    BEAR_MARKET : Sustained price decline
+        - Price below key moving averages
+        - Negative momentum
+        - Risk-off environment
+        
+    CAPITULATION : Panic selling climax
+        - Extreme drawdowns (>50% from high)
+        - Spike in volatility
+        - Often marks bottoming process
+    """
+    ACCUMULATION = "accumulation"
+    EARLY_BULL = "early_bull"
+    EXPLOSIVE_BULL = "explosive"
+    DISTRIBUTION = "distribution"
+    BEAR_MARKET = "bear"
+    CAPITULATION = "capitulation"
+
+
+# ==============================================================================
+# CUSTOM DATA CLASS FOR VIX INDEX
+# ==============================================================================
+
+class CBOE(PythonData):
+    """
+    Custom data class for importing CBOE VIX Index data.
+    
+    The VIX (Volatility Index) measures market expectations of near-term
+    volatility conveyed by S&P 500 stock index option prices. It is used
+    in this strategy as a macro risk indicator.
+    
+    Data Source:
+    -----------
+    CBOE publishes daily VIX data in CSV format at their website.
+    
+    VIX Interpretation:
+    ------------------
+    - VIX < 15:  Low volatility, complacency
+    - VIX 15-25: Normal market conditions
+    - VIX 25-35: Elevated fear, increased hedging
+    - VIX > 35:  Extreme fear, potential capitulation
+    
+    Usage in Strategy:
+    -----------------
+    - High VIX (>25): Reduce position sizes
+    - Extreme VIX (>35): Contrarian signal (potential bottom)
+    """
+    
+    def get_source(self, config, date, is_live_mode):
+        """
+        Define the data source URL for VIX data.
+        
+        Returns:
+        -------
+        SubscriptionDataSource
+            Configuration for fetching VIX data from CBOE website.
+        """
+        return SubscriptionDataSource(
+            "http://www.cboe.com/publish/scheduledtask/mktdata/datahouse/vixcurrent.csv",
+            SubscriptionTransportMedium.REMOTE_FILE
+        )
+    
+    def reader(self, config, line, date, is_live_mode):
+        """
+        Parse a single line of VIX CSV data.
+        
+        Parameters:
+        ----------
+        config : SubscriptionDataConfig
+            Configuration object for the data subscription.
+        line : str
+            Single line from the CSV file.
+        date : datetime
+            Current algorithm date.
+        is_live_mode : bool
+            Whether algorithm is running in live mode.
+            
+        Returns:
+        -------
+        CBOE or None
+            Parsed data object, or None if line cannot be parsed.
+        """
+        # Skip header rows and empty lines
+        if not (line.strip() and line[0].isdigit()):
+            return None
+        
+        # Initialize data object
+        index = CBOE()
+        index.symbol = config.symbol
+        
+        try:
+            # Parse CSV columns: Date, Open, High, Low, Close
+            data = line.split(',')
+            index.time = datetime.strptime(data[0], "%m/%d/%Y")
+            index.value = float(data[4])  # Use Close price as primary value
+            
+            # Store OHLC data for potential future use
+            index["Open"] = float(data[1])
+            index["High"] = float(data[2])
+            index["Low"] = float(data[3])
+            index["Close"] = float(data[4])
+        except (ValueError, IndexError):
+            # Return None for malformed data lines
+            return None
+        
+        return index
+
+
+# ==============================================================================
+# MAIN STRATEGY CLASS
+# ==============================================================================
+
+class AdaptiveGoldSilverBTCStrategy(QCAlgorithm):
+    """
+    Adaptive Gold/Silver-Bitcoin Hedging Strategy.
+    
+    This algorithm dynamically adjusts its trading parameters based on
+    detected Bitcoin market phases. It combines precious metals signals
+    with momentum indicators to generate trading decisions.
+    
+    Key Features:
+    ------------
+    1. Dynamic phase detection using multi-factor analysis
+    2. Adaptive signal weighting based on market regime
+    3. Risk parity position sizing with volatility targeting
+    4. Multiple layers of risk management (stops, phase limits, warnings)
+    
+    Asset Universe:
+    --------------
+    - Primary:    BTCUSD (Bitcoin)
+    - Indicators: GLD (Gold ETF), SLV (Silver ETF), VIX
+    
+    Rebalancing:
+    -----------
+    - Frequency: Daily evaluation
+    - Execution: When position change exceeds 5% threshold
+    
+    Performance Targets:
+    -------------------
+    - Sharpe Ratio: > 1.0
+    - Maximum Drawdown: < 20%
+    - Annual Turnover: ~500-800%
+    """
+    
+    # ==========================================================================
+    # INITIALIZATION
+    # ==========================================================================
+    
+    def initialize(self):
+        """
+        Initialize the algorithm with all necessary configurations.
+        
+        This method is called once at the start of the algorithm and sets up:
+        - Backtest date range and starting capital
+        - Asset subscriptions and benchmark
+        - Strategy parameters for each market phase
+        - Data storage structures
+        - Scheduled events for daily updates
+        - Performance tracking charts
+        """
+        
+        # ----------------------------------------------------------------------
+        # BACKTEST CONFIGURATION
+        # ----------------------------------------------------------------------
+        # Define the backtest period and starting capital
+        # Competition requires 7+ year backtest period
+        
+        self.set_start_date(2001, 1, 1)    # Start date for backtest
+        self.set_end_date(2026, 1, 10)     # End date for backtest
+        self.set_cash(100000)              # Starting capital: $100,000 USD
+        self.set_benchmark("SPY")          # Benchmark for comparison
+        
+        # ----------------------------------------------------------------------
+        # ASSET UNIVERSE SETUP
+        # ----------------------------------------------------------------------
+        # Subscribe to all required securities with daily resolution
+        
+        # Primary trading asset: Bitcoin
+        # Using BTCUSD crypto pair for spot exposure
+        self.btc = self.add_crypto("BTCUSD", Resolution.DAILY).symbol
+        
+        # Precious metals ETFs as macro indicators
+        # GLD: SPDR Gold Shares - tracks gold bullion price
+        # SLV: iShares Silver Trust - tracks silver price
+        self.gold = self.add_equity("GLD", Resolution.DAILY).symbol
+        self.silver = self.add_equity("SLV", Resolution.DAILY).symbol
+        
+        # VIX Index for volatility regime detection
+        # Custom data class fetches from CBOE website
+        self.vix = self.add_data(CBOE, "VIX", Resolution.DAILY).symbol
+        
+        # ----------------------------------------------------------------------
+        # PHASE-SPECIFIC STRATEGY PARAMETERS
+        # ----------------------------------------------------------------------
+        # Each market phase has optimized parameters based on historical analysis
+        # 
+        # Parameter Descriptions:
+        # - max_position:    Maximum portfolio allocation to BTC (0.0 to 1.0)
+        # - corr_weight:     Weight given to precious metals signal (0.0 to 1.0)
+        # - momentum_weight: Weight given to BTC momentum signal (0.0 to 1.0)
+        # - vol_ceiling:     Maximum allowed BTC volatility before scaling down
+        
+        self.phase_params = {
+            
+            BTCPhase.ACCUMULATION: {
+                # Accumulation Phase: Sideways consolidation after bear market
+                # - High correlation weight: metals signals more reliable in quiet markets
+                # - Moderate position: building exposure gradually
+                # - Low vol ceiling: respect the low-volatility environment
+                'max_position': 0.50,
+                'corr_weight': 0.6,
+                'momentum_weight': 0.4,
+                'vol_ceiling': 0.60,
+            },
+            
+            BTCPhase.EARLY_BULL: {
+                # Early Bull Phase: Beginning of new uptrend
+                # - Balanced weights: both signals have predictive value
+                # - Higher position: capitalize on emerging trend
+                # - Higher vol ceiling: accept increased volatility
+                'max_position': 0.70,
+                'corr_weight': 0.4,
+                'momentum_weight': 0.6,
+                'vol_ceiling': 0.80,
+            },
+            
+            BTCPhase.EXPLOSIVE_BULL: {
+                # Explosive Bull Phase: Parabolic advance
+                # - Minimal correlation weight: precious metals decouple from BTC
+                # - Pure momentum: crypto-specific factors dominate
+                # - Reduced position cap: manage risk during euphoria
+                # - High vol ceiling: extreme volatility is expected
+                'max_position': 0.40,
+                'corr_weight': 0.1,
+                'momentum_weight': 0.9,
+                'vol_ceiling': 1.50,
+            },
+            
+            BTCPhase.DISTRIBUTION: {
+                # Distribution Phase: Topping process
+                # - Moderate correlation weight: macro factors re-emerge
+                # - Higher momentum weight: respect weakening price action
+                # - Reduced position: defensive posture
+                'max_position': 0.30,
+                'corr_weight': 0.3,
+                'momentum_weight': 0.7,
+                'vol_ceiling': 0.70,
+            },
+            
+            BTCPhase.BEAR_MARKET: {
+                # Bear Market Phase: Sustained decline
+                # - Balanced weights: both signals important for timing
+                # - Minimal position: capital preservation priority
+                # - Moderate vol ceiling: volatility typically elevated
+                'max_position': 0.20,
+                'corr_weight': 0.5,
+                'momentum_weight': 0.5,
+                'vol_ceiling': 0.80,
+            },
+            
+            BTCPhase.CAPITULATION: {
+                # Capitulation Phase: Panic selling climax
+                # - High correlation weight: macro bottom often coincides with gold strength
+                # - Lower momentum weight: momentum is extremely negative but reversing
+                # - Higher position: contrarian accumulation opportunity
+                # - High vol ceiling: accept extreme volatility for entry
+                'max_position': 0.60,
+                'corr_weight': 0.7,
+                'momentum_weight': 0.3,
+                'vol_ceiling': 1.20,
+            },
+        }
+        
+        # ----------------------------------------------------------------------
+        # TECHNICAL INDICATOR LOOKBACK PERIODS
+        # ----------------------------------------------------------------------
+        # Define standard lookback windows for calculations
+        
+        self.lookback = {
+            'short': 5,        # Short-term: ~1 trading week
+            'medium': 20,      # Medium-term: ~1 trading month
+            'long': 60,        # Long-term: ~1 quarter
+            'very_long': 120   # Very long-term: ~6 months
+        }
+        
+        # ----------------------------------------------------------------------
+        # DATA STORAGE STRUCTURES
+        # ----------------------------------------------------------------------
+        # Use deques for efficient rolling window calculations
+        # maxlen ensures automatic removal of oldest data points
+        
+        # Price history for each asset (150 days of data)
+        self.prices = {
+            'gold': deque(maxlen=150),
+            'silver': deque(maxlen=150),
+            'btc': deque(maxlen=150),
+            'vix': deque(maxlen=150)
+        }
+        
+        # Daily returns history for correlation calculations
+        self.returns = {
+            'gold': deque(maxlen=150),
+            'silver': deque(maxlen=150),
+            'btc': deque(maxlen=150)
+        }
+        
+        # ----------------------------------------------------------------------
+        # STATE TRACKING VARIABLES
+        # ----------------------------------------------------------------------
+        
+        # Current detected market phase
+        self.current_phase = BTCPhase.ACCUMULATION
+        
+        # History of phase detections (for smoothing transitions)
+        self.phase_history = []
+        
+        # Position entry tracking for stop loss calculations
+        self.entry_price = None       # Price at which position was entered
+        self.entry_date = None        # Date when position was entered
+        self.highest_price = None     # Highest price since entry (for trailing stop)
+        
+        # Warmup flag to ensure sufficient data before trading
+        self.warmup_complete = False
+        
+        # ----------------------------------------------------------------------
+        # SCHEDULED EVENTS
+        # ----------------------------------------------------------------------
+        # Schedule daily strategy update after market open
+        # Using gold's market hours as reference (US equity market)
+        
+        self.schedule.on(
+            self.date_rules.every_day(),
+            self.time_rules.after_market_open(self.gold, 30),  # 30 min after open
+            self.daily_update
+        )
+        
+        # ----------------------------------------------------------------------
+        # PERFORMANCE CHARTS
+        # ----------------------------------------------------------------------
+        # Initialize custom charts for strategy monitoring
+        
+        self.init_charts()
+        
+        # Log initialization complete
+        self.debug("=" * 60)
+        self.debug("ADAPTIVE GOLD/SILVER-BTC STRATEGY INITIALIZED")
+        self.debug(f"Backtest Period: {self.start_date} to {self.end_date}")
+        self.debug(f"Starting Capital: ${self.portfolio.cash:,.0f}")
+        self.debug("=" * 60)
+    
+    # ==========================================================================
+    # CHART INITIALIZATION
+    # ==========================================================================
+    
+    def init_charts(self):
+        """
+        Initialize custom performance tracking charts.
+        
+        Creates a dashboard chart with three series:
+        1. Position %: Current BTC allocation as percentage of portfolio
+        2. Phase Score: Numeric representation of current market phase
+        3. Signal Strength: Combined signal value for debugging
+        """
+        chart = Chart("Strategy Dashboard")
+        self.add_chart(chart)
+        
+        # Position tracking (0-100%)
+        chart.add_series(Series("Position %", SeriesType.LINE, 0))
+        
+        # Phase indicator (0-5 corresponding to enum values)
+        chart.add_series(Series("Phase Score", SeriesType.LINE, 1))
+        
+        # Signal strength (-100 to +100)
+        chart.add_series(Series("Signal Strength", SeriesType.LINE, 2))
+    
+    # ==========================================================================
+    # DATA COLLECTION (OnData Event Handler)
+    # ==========================================================================
+    
+    def on_data(self, data: Slice):
+        """
+        Process incoming market data and update price/return histories.
+        
+        This method is called automatically by the framework whenever new
+        data is available. It handles:
+        1. Extracting closing prices from bar data
+        2. Calculating daily returns
+        3. Storing data in rolling window structures
+        
+        Parameters:
+        ----------
+        data : Slice
+            Container with all available data for current time step.
+            Includes bars, ticks, and custom data objects.
+        
+        Notes:
+        -----
+        - VIX data requires special handling as it's a custom data type
+        - Returns are calculated as simple percentage changes
+        - Data is automatically trimmed by deque maxlen property
+        """
+        # Process each asset's price data
+        for symbol, key in [(self.gold, 'gold'), 
+                            (self.silver, 'silver'), 
+                            (self.btc, 'btc')]:
+            
+            # Check if bar data exists for this symbol
+            if symbol in data.bars:
+                # Extract closing price and convert to float
+                price = float(data.bars[symbol].close)
+                self.prices[key].append(price)
+                
+                # Calculate daily return if we have previous price
+                if len(self.prices[key]) >= 2:
+                    previous_price = self.prices[key][-2]
+                    daily_return = (price / previous_price) - 1
+                    self.returns[key].append(daily_return)
+        
+        # Handle VIX custom data separately
+        # VIX data structure differs from standard bar data
+        if self.vix in data and data[self.vix]:
+            try:
+                vix_value = float(data[self.vix].value)
+                self.prices['vix'].append(vix_value)
+            except (AttributeError, TypeError):
+                # Skip if VIX data is malformed
+                pass
+    
+    # ==========================================================================
+    # DAILY STRATEGY UPDATE
+    # ==========================================================================
+    
+    def daily_update(self):
+        """
+        Execute daily strategy logic.
+        
+        This is the main strategy execution method, called daily after market
+        open. It orchestrates the complete trading decision process:
+        
+        1. Data Validation: Ensure sufficient history for calculations
+        2. Phase Detection: Classify current market regime
+        3. Signal Generation: Calculate trading signals
+        4. Position Sizing: Determine target allocation
+        5. Risk Management: Apply stops and limits
+        6. Trade Execution: Adjust portfolio holdings
+        7. Monitoring: Update charts and logs
+        
+        The method exits early if:
+        - Insufficient historical data (warmup period)
+        - Signal calculation fails
+        """
+        # ----------------------------------------------------------------------
+        # STEP 1: DATA VALIDATION
+        # ----------------------------------------------------------------------
+        # Ensure we have enough historical data for all calculations
+        # Require at least 'very_long' (120) days of BTC price data
+        
+        if len(self.prices['btc']) < self.lookback['very_long']:
+            return  # Exit early, still in warmup period
+        
+        # Mark warmup as complete on first successful pass
+        if not self.warmup_complete:
+            self.warmup_complete = True
+            self.debug("Warmup complete - beginning trading")
+        
+        # ----------------------------------------------------------------------
+        # STEP 2: MARKET PHASE DETECTION
+        # ----------------------------------------------------------------------
+        # Classify current market regime using multi-factor analysis
+        
+        self.current_phase = self.detect_btc_phase()
+        
+        # ----------------------------------------------------------------------
+        # STEP 3: SIGNAL GENERATION
+        # ----------------------------------------------------------------------
+        # Calculate all trading signals (metals, momentum, breakouts, etc.)
+        
+        signals = self.calculate_signals()
+        
+        # Validate signal calculation succeeded
+        if signals is None:
+            self.debug("Warning: Signal calculation failed")
+            return
+        
+        # ----------------------------------------------------------------------
+        # STEP 4: POSITION SIZING
+        # ----------------------------------------------------------------------
+        # Determine target position based on signals and phase parameters
+        
+        target = self.calculate_target_position(signals)
+        
+        # ----------------------------------------------------------------------
+        # STEP 5: RISK MANAGEMENT
+        # ----------------------------------------------------------------------
+        # Apply stop losses, position limits, and risk warnings
+        
+        target = self.apply_risk_controls(target, signals)
+        
+        # ----------------------------------------------------------------------
+        # STEP 6: TRADE EXECUTION
+        # ----------------------------------------------------------------------
+        # Execute trades if position change exceeds threshold
+        
+        self.execute_trade(target, signals)
+        
+        # ----------------------------------------------------------------------
+        # STEP 7: MONITORING
+        # ----------------------------------------------------------------------
+        # Update performance charts
+        
+        self.update_charts(signals, target)
+    
+    # ==========================================================================
+    # MARKET PHASE DETECTION
+    # ==========================================================================
+    
+    def detect_btc_phase(self) -> BTCPhase:
+        """
+        Detect the current Bitcoin market phase using technical indicators.
+        
+        This method analyzes multiple dimensions of price behavior to classify
+        the market into one of six phases. The classification uses a scoring
+        system where each phase accumulates points based on matching criteria.
+        
+        Indicators Used:
+        ---------------
+        - 90-day price return (trend strength)
+        - 30-day annualized volatility (risk level)
+        - Price position relative to MA(20), MA(60), MA(120)
+        - Drawdown from 120-day high
+        - MA crossover relationships
+        
+        Phase Transition Smoothing:
+        --------------------------
+        To prevent whipsawing between phases, a 3-day confirmation filter
+        is applied. The detected phase must persist for 3 consecutive days
+        before the strategy officially transitions.
+        
+        Returns:
+        -------
+        BTCPhase
+            The detected market phase enumeration value.
+        """
+        # Convert price and return deques to numpy arrays for efficient calculation
+        btc = np.array(list(self.prices['btc']))
+        btc_ret = np.array(list(self.returns['btc']))
+        
+        # ----------------------------------------------------------------------
+        # CALCULATE TECHNICAL INDICATORS
+        # ----------------------------------------------------------------------
+        
+        # Moving averages at different timeframes
+        ma20 = np.mean(btc[-20:])   # Short-term trend
+        ma60 = np.mean(btc[-60:])   # Medium-term trend
+        ma120 = np.mean(btc[-120:]) if len(btc) >= 120 else ma60  # Long-term trend
+        
+        # Current price
+        current_price = btc[-1]
+        
+        # 30-day annualized volatility
+        # Standard deviation of returns * sqrt(252) to annualize
+        if len(btc_ret) >= 30:
+            vol_30d = np.std(btc_ret[-30:]) * np.sqrt(252)
+        else:
+            vol_30d = 0.5  # Default assumption if insufficient data
+        
+        # 90-day cumulative return
+        if len(btc) >= 90:
+            ret_90d = (current_price / btc[-90]) - 1
+        else:
+            ret_90d = 0
+        
+        # Drawdown from 120-day high
+        high_120d = max(btc[-120:]) if len(btc) >= 120 else current_price
+        drawdown = (current_price / high_120d) - 1  # Negative value
+        
+        # Price position relative to moving averages
+        price_vs_ma20 = (current_price / ma20) - 1
+        price_vs_ma60 = (current_price / ma60) - 1
+        ma20_vs_ma60 = (ma20 / ma60) - 1
+        
+        # ----------------------------------------------------------------------
+        # PHASE SCORING SYSTEM
+        # ----------------------------------------------------------------------
+        # Initialize scores for each phase
+        
+        phase_scores = {
+            BTCPhase.EXPLOSIVE_BULL: 0,
+            BTCPhase.EARLY_BULL: 0,
+            BTCPhase.ACCUMULATION: 0,
+            BTCPhase.DISTRIBUTION: 0,
+            BTCPhase.BEAR_MARKET: 0,
+            BTCPhase.CAPITULATION: 0,
+        }
+        
+        # --- EXPLOSIVE BULL PHASE ---
+        # Characteristics: Massive gains, extreme volatility, price far above MAs
+        if ret_90d > 1.0 and vol_30d > 0.8 and price_vs_ma60 > 0.3:
+            phase_scores[BTCPhase.EXPLOSIVE_BULL] += 3  # Strong match
+        if ret_90d > 0.5 and vol_30d > 0.6:
+            phase_scores[BTCPhase.EXPLOSIVE_BULL] += 2  # Moderate match
+        
+        # --- EARLY BULL PHASE ---
+        # Characteristics: Moderate gains, breaking above MAs, controlled volatility
+        if 0.2 < ret_90d <= 1.0 and price_vs_ma60 > 0.1 and vol_30d < 0.8:
+            phase_scores[BTCPhase.EARLY_BULL] += 3
+        if ma20_vs_ma60 > 0.05 and price_vs_ma20 > 0:
+            phase_scores[BTCPhase.EARLY_BULL] += 1
+        
+        # --- ACCUMULATION PHASE ---
+        # Characteristics: Low volatility, narrow range, price near MA
+        if abs(ret_90d) < 0.2 and vol_30d < 0.5 and abs(price_vs_ma60) < 0.1:
+            phase_scores[BTCPhase.ACCUMULATION] += 3
+        if vol_30d < 0.4:
+            phase_scores[BTCPhase.ACCUMULATION] += 1
+        
+        # --- DISTRIBUTION PHASE ---
+        # Characteristics: Price rolling over from highs, momentum slowing
+        if ret_90d > 0.5 and price_vs_ma20 < -0.05 and price_vs_ma60 > 0.2:
+            phase_scores[BTCPhase.DISTRIBUTION] += 3
+        if -0.25 < drawdown < -0.1:
+            phase_scores[BTCPhase.DISTRIBUTION] += 2
+        
+        # --- BEAR MARKET PHASE ---
+        # Characteristics: Sustained decline, price below MAs, negative momentum
+        if ret_90d < -0.2 and price_vs_ma60 < -0.1 and ma20_vs_ma60 < -0.05:
+            phase_scores[BTCPhase.BEAR_MARKET] += 3
+        if drawdown < -0.3:
+            phase_scores[BTCPhase.BEAR_MARKET] += 2
+        
+        # --- CAPITULATION PHASE ---
+        # Characteristics: Extreme decline, high volatility, massive drawdown
+        if ret_90d < -0.4 and vol_30d > 0.8 and drawdown < -0.5:
+            phase_scores[BTCPhase.CAPITULATION] += 3
+        if drawdown < -0.6:
+            phase_scores[BTCPhase.CAPITULATION] += 2
+        
+        # ----------------------------------------------------------------------
+        # SELECT HIGHEST SCORING PHASE
+        # ----------------------------------------------------------------------
+        
+        detected_phase = max(phase_scores, key=phase_scores.get)
+        
+        # ----------------------------------------------------------------------
+        # PHASE TRANSITION SMOOTHING
+        # ----------------------------------------------------------------------
+        # Require 3 consecutive days of same detection before switching
+        # This prevents noisy transitions
+        
+        if detected_phase != self.current_phase:
+            self.phase_history.append(detected_phase)
+            
+            # Check if we have 3 consecutive detections of the new phase
+            if len(self.phase_history) >= 3:
+                if self.phase_history[-3:] == [detected_phase] * 3:
+                    self.debug(f"Phase transition: {self.current_phase.value} -> {detected_phase.value}")
+                    return detected_phase
+            
+            # Not enough confirmation, keep current phase
+            return self.current_phase
+        
+        return detected_phase
+    
+    # ==========================================================================
+    # SIGNAL CALCULATION
+    # ==========================================================================
+    
+    def calculate_signals(self) -> dict:
+        """
+        Calculate all trading signals used for position decisions.
+        
+        This method computes a comprehensive set of signals including:
+        - Precious metals momentum (5-day and 20-day)
+        - BTC momentum at multiple timeframes
+        - Rolling correlation between gold and BTC
+        - Volatility measures
+        - Breakout indicators
+        - VIX levels
+        
+        Signal Normalization:
+        --------------------
+        Raw price changes are normalized to create signals in the range [-1, +1]
+        using typical move magnitudes as scaling factors:
+        - Gold: 3% for 5-day, 5% for 20-day
+        - Silver: 5% for 5-day, 8% for 20-day
+        - BTC: 10% for 5-day, 20% for 20-day
+        
+        Returns:
+        -------
+        dict or None
+            Dictionary containing all calculated signals, or None if
+            calculation fails due to insufficient data or errors.
+        
+        Signal Dictionary Keys:
+        ----------------------
+        - gold_5d, silver_5d: 5-day precious metals returns
+        - gold_20d, silver_20d: 20-day precious metals returns
+        - metals_signal: Normalized composite precious metals signal
+        - btc_5d, btc_20d: BTC momentum at different timeframes
+        - momentum_signal: Normalized BTC momentum signal
+        - correlation: 60-day rolling correlation (gold vs BTC returns)
+        - btc_vol, gold_vol: Annualized volatility
+        - breakout_up, breakout_down: Boolean breakout indicators
+        - vix, vix_high, vix_extreme: VIX level and threshold flags
+        - ma20, ma60: BTC moving averages
+        - btc_price: Current BTC price
+        """
+        try:
+            # Convert deques to numpy arrays
+            gold = np.array(list(self.prices['gold']))
+            silver = np.array(list(self.prices['silver']))
+            btc = np.array(list(self.prices['btc']))
+            gold_ret = np.array(list(self.returns['gold']))
+            btc_ret = np.array(list(self.returns['btc']))
+            
+            # ------------------------------------------------------------------
+            # PRECIOUS METALS SIGNALS
+            # ------------------------------------------------------------------
+            
+            # 5-day returns (short-term momentum)
+            gold_5d = (gold[-1] / gold[-6] - 1) if len(gold) >= 6 else 0
+            silver_5d = (silver[-1] / silver[-6] - 1) if len(silver) >= 6 else 0
+            
+            # 20-day returns (medium-term trend)
+            gold_20d = (gold[-1] / gold[-21] - 1) if len(gold) >= 21 else 0
+            silver_20d = (silver[-1] / silver[-21] - 1) if len(silver) >= 21 else 0
+            
+            # Composite precious metals signal (-1 to +1)
+            # Normalize each component by typical move magnitude, then average
+            metals_signal = np.clip(
+                (gold_5d / 0.03 +       # Gold 5-day, scaled by 3%
+                 silver_5d / 0.05 +     # Silver 5-day, scaled by 5%
+                 gold_20d / 0.05 +      # Gold 20-day, scaled by 5%
+                 silver_20d / 0.08      # Silver 20-day, scaled by 8%
+                ) / 4,                   # Average of four components
+                -1, 1                    # Clip to valid range
+            )
+            
+            # ------------------------------------------------------------------
+            # CORRELATION CALCULATION
+            # ------------------------------------------------------------------
+            # 60-day rolling correlation between gold and BTC daily returns
+            # Higher correlation means precious metals signals are more predictive
+            
+            if len(gold_ret) >= 60 and len(btc_ret) >= 60:
+                correlation = np.corrcoef(gold_ret[-60:], btc_ret[-60:])[0, 1]
+            else:
+                correlation = 0.1  # Default assumption during warmup
+            
+            # ------------------------------------------------------------------
+            # VOLATILITY MEASURES
+            # ------------------------------------------------------------------
+            # 30-day annualized volatility for position sizing
+            
+            if len(btc_ret) >= 30:
+                btc_vol = np.std(btc_ret[-30:]) * np.sqrt(252)
+            else:
+                btc_vol = 0.5  # Default: 50% annualized
+            
+            if len(gold_ret) >= 30:
+                gold_vol = np.std(gold_ret[-30:]) * np.sqrt(252)
+            else:
+                gold_vol = 0.15  # Default: 15% annualized
+            
+            # ------------------------------------------------------------------
+            # BTC MOMENTUM SIGNALS
+            # ------------------------------------------------------------------
+            
+            # Price-based momentum at different timeframes
+            btc_5d = (btc[-1] / btc[-6] - 1) if len(btc) >= 6 else 0
+            btc_20d = (btc[-1] / btc[-21] - 1) if len(btc) >= 21 else 0
+            
+            # Moving averages for trend determination
+            ma20 = np.mean(btc[-20:])
+            ma60 = np.mean(btc[-60:])
+            
+            # Composite momentum signal (-1 to +1)
+            momentum_signal = np.clip(
+                (btc_5d / 0.10 +                    # 5-day return scaled by 10%
+                 btc_20d / 0.20 +                   # 20-day return scaled by 20%
+                 (btc[-1] / ma20 - 1) / 0.05       # Price vs MA20 scaled by 5%
+                ) / 3,                              # Average of three components
+                -1, 1                               # Clip to valid range
+            )
+            
+            # ------------------------------------------------------------------
+            # BREAKOUT SIGNALS
+            # ------------------------------------------------------------------
+            # Donchian channel breakouts (20-day high/low)
+            
+            if len(btc) >= 21:
+                btc_20d_high = max(btc[-21:-1])  # 20-day high (excluding today)
+                btc_20d_low = min(btc[-21:-1])   # 20-day low (excluding today)
+            else:
+                btc_20d_high = btc[-1]
+                btc_20d_low = btc[-1]
+            
+            breakout_up = btc[-1] > btc_20d_high    # New 20-day high
+            breakout_down = btc[-1] < btc_20d_low   # New 20-day low
+            
+            # ------------------------------------------------------------------
+            # VIX SIGNALS
+            # ------------------------------------------------------------------
+            # Fear gauge for risk management
+            
+            vix_level = self.prices['vix'][-1] if len(self.prices['vix']) > 0 else 20
+            vix_high = vix_level > 25      # Elevated fear
+            vix_extreme = vix_level > 35   # Extreme fear (potential capitulation)
+            
+            # ------------------------------------------------------------------
+            # RETURN SIGNAL DICTIONARY
+            # ------------------------------------------------------------------
+            
+            return {
+                # Raw price data
+                'gold_5d': gold_5d,
+                'silver_5d': silver_5d,
+                'btc_5d': btc_5d,
+                'btc_20d': btc_20d,
+                'btc_price': btc[-1],
+                'btc_vol': btc_vol,
+                'gold_vol': gold_vol,
+                'correlation': correlation,
+                'vix': vix_level,
+                
+                # Composite signals
+                'metals_signal': metals_signal,
+                'momentum_signal': momentum_signal,
+                
+                # Boolean signals
+                'breakout_up': breakout_up,
+                'breakout_down': breakout_down,
+                'vix_high': vix_high,
+                'vix_extreme': vix_extreme,
+                
+                # Moving averages
+                'ma20': ma20,
+                'ma60': ma60,
+            }
+            
+        except Exception as e:
+            self.debug(f"Signal calculation error: {e}")
+            return None
+    
+    # ==========================================================================
+    # POSITION SIZING
+    # ==========================================================================
+    
+    def calculate_target_position(self, signals: dict) -> float:
+        """
+        Calculate target position size based on signals and phase parameters.
+        
+        This method combines the precious metals signal and momentum signal
+        using phase-specific weights to determine the optimal BTC allocation.
+        
+        Position Calculation Formula:
+        ----------------------------
+        combined_signal = (metals_signal × corr_weight × corr_factor) + 
+                         (momentum_signal × momentum_weight)
+        
+        target_position = combined_signal × max_position (if signal > 0)
+                        = 0 (if signal <= 0)
+        
+        The correlation factor adjusts metals signal weight based on the
+        actual rolling correlation - higher correlation means the metals
+        signal is more reliable.
+        
+        Additional Adjustments:
+        ----------------------
+        - Breakout bonus: +30% for upside breakout, -50% for downside
+        - VIX extreme: Contrarian (multiply by -0.5)
+        - VIX high: Conservative (multiply by 0.7)
+        
+        Parameters:
+        ----------
+        signals : dict
+            Dictionary of calculated signals from calculate_signals()
+        
+        Returns:
+        -------
+        float
+            Target position size as fraction of portfolio (0.0 to max_position)
+        """
+        # Get phase-specific parameters
+        params = self.phase_params[self.current_phase]
+        
+        corr_weight = params['corr_weight']
+        mom_weight = params['momentum_weight']
+        max_pos = params['max_position']
+        
+        # ----------------------------------------------------------------------
+        # CORRELATION-ADJUSTED METALS WEIGHT
+        # ----------------------------------------------------------------------
+        # When correlation is higher, precious metals signals are more predictive
+        # Scale factor ranges from 0.3 (low corr) to 1.0 (high corr)
+        
+        correlation_factor = max(0.3, min(1.0, signals['correlation'] * 5))
+        
+        # ----------------------------------------------------------------------
+        # CALCULATE WEIGHTED SIGNAL CONTRIBUTIONS
+        # ----------------------------------------------------------------------
+        
+        # Precious metals contribution
+        metals_contribution = (signals['metals_signal'] * 
+                             corr_weight * 
+                             correlation_factor)
+        
+        # Momentum contribution
+        momentum_contribution = signals['momentum_signal'] * mom_weight
+        
+        # Combined signal
+        combined_signal = metals_contribution + momentum_contribution
+        
+        # ----------------------------------------------------------------------
+        # BREAKOUT ADJUSTMENTS
+        # ----------------------------------------------------------------------
+        
+        if signals['breakout_up']:
+            # New 20-day high: bullish, boost signal
+            combined_signal += 0.3
+        elif signals['breakout_down']:
+            # New 20-day low: bearish, reduce signal significantly
+            combined_signal -= 0.5
+        
+        # ----------------------------------------------------------------------
+        # VIX ADJUSTMENTS
+        # ----------------------------------------------------------------------
+        
+        if signals['vix_extreme']:
+            # Extreme fear: contrarian approach
+            # Often marks capitulation bottoms
+            combined_signal *= -0.5
+        elif signals['vix_high']:
+            # Elevated fear: be more conservative
+            combined_signal *= 0.7
+        
+        # ----------------------------------------------------------------------
+        # CONVERT SIGNAL TO POSITION
+        # ----------------------------------------------------------------------
+        
+        if combined_signal > 0:
+            # Positive signal: scale position by signal strength
+            target = combined_signal * max_pos
+        else:
+            # Negative signal: go flat (no shorting)
+            target = 0
+        
+        # Ensure position is within valid bounds
+        return np.clip(target, 0, max_pos)
+    
+    # ==========================================================================
+    # RISK MANAGEMENT
+    # ==========================================================================
+    
+    def apply_risk_controls(self, target: float, signals: dict) -> float:
+        """
+        Apply risk management rules to the target position.
+        
+        This method implements multiple layers of risk control:
+        
+        1. Volatility Ceiling:
+           - If BTC volatility exceeds phase-specific ceiling, scale down position
+           - Implements risk parity concept
+        
+        2. Fixed Stop Loss:
+           - Exit if position PnL reaches -15%
+           - Protects against large losses
+        
+        3. Trailing Stop:
+           - After +20% gain, exit if price falls 10% from high
+           - Locks in profits during trends
+        
+        4. Precious Metals Warning:
+           - If metals signal strongly negative (-0.6) with decent correlation
+           - Cap position at 30% of phase maximum
+           - Acts as macro risk early warning
+        
+        5. Phase-Specific Limits:
+           - Explosive bull phase has hard 40% cap regardless of signal
+           - Prevents overexposure during parabolic moves
+        
+        Parameters:
+        ----------
+        target : float
+            Target position from calculate_target_position()
+        signals : dict
+            Dictionary of calculated signals
+        
+        Returns:
+        -------
+        float
+            Risk-adjusted target position
+        """
+        params = self.phase_params[self.current_phase]
+        
+        # ----------------------------------------------------------------------
+        # VOLATILITY CEILING
+        # ----------------------------------------------------------------------
+        # Scale down position if volatility exceeds phase-specific ceiling
+        
+        if signals['btc_vol'] > params['vol_ceiling']:
+            vol_ratio = params['vol_ceiling'] / signals['btc_vol']
+            target = target * vol_ratio
+            self.debug(f"Volatility exceeded limit, position scaled to {vol_ratio:.1%}")
+        
+        # ----------------------------------------------------------------------
+        # STOP LOSS CHECKS
+        # ----------------------------------------------------------------------
+        # Only apply if we have an active position with entry price
+        
+        if self.entry_price and self.portfolio[self.btc].invested:
+            # Calculate current PnL
+            current_pnl = (signals['btc_price'] / self.entry_price) - 1
+            
+            # Fixed stop loss at -15%
+            if current_pnl < -0.15:
+                self.debug(f"Fixed stop loss triggered: PnL = {current_pnl:.1%}")
+                return 0.0  # Exit position
+            
+            # Trailing stop: protect profits after +20% gain
+            if self.highest_price:
+                from_high = (signals['btc_price'] / self.highest_price) - 1
+                
+                # If we're up 20%+ and fall 10% from high, exit
+                if current_pnl > 0.20 and from_high < -0.10:
+                    self.debug(f"Trailing stop triggered: {from_high:.1%} from high")
+                    return 0.0  # Exit position
+        
+        # ----------------------------------------------------------------------
+        # PRECIOUS METALS WARNING
+        # ----------------------------------------------------------------------
+        # Strong negative metals signal with meaningful correlation
+        
+        if signals['metals_signal'] < -0.6 and signals['correlation'] > 0.15:
+            max_warning_position = params['max_position'] * 0.3
+            target = min(target, max_warning_position)
+            self.debug("Strong precious metals warning, position limited to 30%")
+        
+        # ----------------------------------------------------------------------
+        # PHASE-SPECIFIC HARD LIMITS
+        # ----------------------------------------------------------------------
+        
+        if self.current_phase == BTCPhase.EXPLOSIVE_BULL:
+            # Extra conservative during explosive phase
+            # Parabolic moves are unpredictable
+            target = min(target, 0.40)
+        
+        return target
+    
+    # ==========================================================================
+    # TRADE EXECUTION
+    # ==========================================================================
+    
+    def execute_trade(self, target: float, signals: dict):
+        """
+        Execute trades to adjust portfolio to target position.
+        
+        This method handles:
+        1. Position change threshold filtering (minimum 5% change to trade)
+        2. Order execution via SetHoldings
+        3. Entry/exit tracking for stop loss calculations
+        4. Logging trade details for analysis
+        
+        The 5% threshold prevents excessive trading from small signal
+        fluctuations, reducing transaction costs and slippage.
+        
+        Parameters:
+        ----------
+        target : float
+            Target position as fraction of portfolio (0.0 to 1.0)
+        signals : dict
+            Dictionary of calculated signals for logging
+        """
+        # Get current position as fraction of portfolio
+        current_pct = (self.portfolio[self.btc].holdings_value / 
+                      self.portfolio.total_portfolio_value)
+        
+        # ----------------------------------------------------------------------
+        # POSITION CHANGE THRESHOLD
+        # ----------------------------------------------------------------------
+        # Only trade if position change exceeds 5%
+        # Prevents excessive turnover from noise
+        
+        if abs(target - current_pct) < 0.05:
+            return  # No significant change, skip trading
+        
+        # ----------------------------------------------------------------------
+        # EXECUTE ORDER
+        # ----------------------------------------------------------------------
+        # SetHoldings automatically calculates order quantity to reach target
+        
+        self.set_holdings(self.btc, target)
+        
+        # ----------------------------------------------------------------------
+        # UPDATE POSITION TRACKING
+        # ----------------------------------------------------------------------
+        
+        if target > current_pct:
+            # Increasing position (BUY)
+            if not self.portfolio[self.btc].invested:
+                # New position: record entry details
+                self.entry_price = signals['btc_price']
+                self.entry_date = self.time
+                self.highest_price = signals['btc_price']
+            action = "BUY"
+        else:
+            # Decreasing position (SELL)
+            if target == 0:
+                # Full exit: clear tracking variables
+                self.entry_price = None
+                self.entry_date = None
+                self.highest_price = None
+            action = "SELL"
+        
+        # Update highest price for trailing stop calculation
+        if self.highest_price and signals['btc_price'] > self.highest_price:
+            self.highest_price = signals['btc_price']
+        
+        # ----------------------------------------------------------------------
+        # LOG TRADE DETAILS
+        # ----------------------------------------------------------------------
+        
+        self.debug(
+            f"{action} | Target: {target:.1%} | Phase: {self.current_phase.value} | "
+            f"Metals: {signals['metals_signal']:.2f} | Mom: {signals['momentum_signal']:.2f} | "
+            f"Corr: {signals['correlation']:.2f} | Vol: {signals['btc_vol']:.0%}"
+        )
+    
+    # ==========================================================================
+    # CHART UPDATES
+    # ==========================================================================
+    
+    def update_charts(self, signals: dict, target: float):
+        """
+        Update custom performance tracking charts.
+        
+        Plots three metrics to the Strategy Dashboard chart:
+        1. Position %: Current actual BTC allocation
+        2. Phase Score: Numeric representation of market phase (0-5)
+        3. Signal Strength: Combined signal value (-100 to +100)
+        
+        Parameters:
+        ----------
+        signals : dict
+            Dictionary of calculated signals
+        target : float
+            Target position (may differ from actual if not yet executed)
+        """
+        # Calculate metrics
+        position_pct = (self.portfolio[self.btc].holdings_value / 
+                       self.portfolio.total_portfolio_value * 100)
+        
+        phase_score = list(BTCPhase).index(self.current_phase)
+        
+        signal_strength = ((signals['metals_signal'] + signals['momentum_signal']) 
+                          / 2 * 100)
+        
+        # Plot to chart
+        self.plot("Strategy Dashboard", "Position %", position_pct)
+        self.plot("Strategy Dashboard", "Phase Score", phase_score)
+        self.plot("Strategy Dashboard", "Signal Strength", signal_strength)
+    
+    # ==========================================================================
+    # ALGORITHM TERMINATION
+    # ==========================================================================
+    
+    def on_end_of_algorithm(self):
+        """
+        Handle algorithm termination and generate final summary.
+        
+        This method is called automatically when the backtest ends.
+        It logs final performance statistics for analysis.
+        """
+        # Calculate final statistics
+        final_value = self.portfolio.total_portfolio_value
+        total_return = (final_value / 100000 - 1) * 100
+        
+        # Log summary
+        self.debug("=" * 60)
+        self.debug("ADAPTIVE GOLD/SILVER-BTC HEDGING STRATEGY")
+        self.debug("BACKTEST COMPLETE")
+        self.debug("=" * 60)
+        self.debug(f"Final Portfolio Value: ${final_value:,.0f}")
+        self.debug(f"Total Return: {total_return:.1f}%")
+        self.debug(f"Final Phase: {self.current_phase.value}")
+        self.debug("=" * 60)
+
+
+# ==============================================================================
+# END OF STRATEGY
+# ==============================================================================
